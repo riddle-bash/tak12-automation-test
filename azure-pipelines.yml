@@ -17,5 +17,25 @@ steps:
     displayName: "Install dependencies, browsers & Allure CLI"
 
   - script: |
+      mkdir -p playwright/.auth
+      echo ^{
+      echo   "users": [ > playwright/.auth/users.json
+      echo     ^{
+      echo       "username": "namtest",
+      echo       "password": "123456"
+      echo     ^},
+      echo     ^{
+      echo       "username": "namtest3",
+      echo       "password": "123456"
+      echo     ^},
+      echo     ^{
+      echo       "username": "namtest6",
+      echo       "password": "123456"
+      echo     ^}
+      echo   ]
+      echo ^} >> playwright/.auth/users.json
+    displayName: "Create playwright/.auth/users.json"
+
+  - script: |
       npx playwright test --reporter=line,allure-playwright
     displayName: "Run Playwright Tests"
