@@ -1,17 +1,10 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from '../playwright/fixtures';
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/');
-  await page.getByText('Đăng nhập').first().click();
-  await page.getByRole('textbox', { name: 'Username or email' }).click();
-  await page.getByRole('textbox', { name: 'Username or email' }).fill('namtest');
-  await page.getByRole('textbox', { name: 'Password' }).click();
-  await page.getByRole('textbox', { name: 'Password' }).fill('123456');
-  await page.getByRole('button', { name: 'Sign In' }).click();
-  await page.waitForTimeout(2500);
+  await page.goto('https://demo.tienganhk12.com');
 });
 
-test('Mở một exam sau - Exam: Cambridge Starters (Pre-A1)', async ({ page }) => {
+test('Mở một exam bất kỳ - Exam: Cambridge Starters (Pre-A1)', async ({ page }) => {
   await page.getByText('Chương trình ôn luyện').click();
   await page.getByText('Ôn thi chứng chỉ').hover();
   await page.locator('.sub-menu-item', { hasText: 'Cambridge Starters (Pre-A1)' }).click();
@@ -146,6 +139,7 @@ test('Làm quiz với user PRO (Môn Toán - Practice - Từng câu - Quiz ID: 1
 
   await page.locator('.submit-info-banner').getByRole('button', { name: 'Next' }).click();
   await page.locator('.exercise-by-quiz-header').getByRole('button', { name: 'Nộp bài' }).click();
+  await page.waitForTimeout(500);
   await page.locator('.modal').getByRole('button', { name: 'Nộp bài' }).click();
 
   await page.waitForTimeout(2500);

@@ -13,18 +13,9 @@ steps:
   - script: |
       npm ci
       npx playwright install --with-deps
-    displayName: "Install dependencies & browsers"
+      npm install -g allure-commandline --save-dev
+    displayName: "Install dependencies, browsers & Allure CLI"
 
   - script: |
       npx playwright test --reporter=line,allure-playwright
     displayName: "Run Playwright Tests"
-
-  - script: |
-      npx allure generate ./allure-results --clean -o ./allure-report
-    displayName: "Generate Allure Report"
-
-  - task: PublishBuildArtifacts@1
-    inputs:
-      pathToPublish: 'allure-report'
-      artifactName: 'allure-report'
-    displayName: "Upload Allure Report Artifact"
