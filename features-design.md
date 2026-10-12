@@ -125,7 +125,7 @@ progresses, which is what makes polling show a growing log.
 | ErrorMessage | string(2000) | short reason for a non-`Passed` verdict |
 | ExitCode | int? | |
 | PassedCount / FailedCount | int | parsed from the `line` reporter summary |
-| ArtifactsJson | string | JSON array of artifact paths relative to the script root |
+| ArtifactsJson | string | JSON array of **root-relative URLs**, e.g. `/Upload/Artifacts/12/…/video.webm` |
 | ExecutedByUserId | long? | |
 | HangfireJobId | string(256) | set while queued, so a `Pending` run can be cancelled |
 | CancellationRequested | bool | set by `StopTest`; the job polls it and kills the process |
@@ -265,15 +265,21 @@ CTH.QuizSystem.EntityFrameworkCore/
 ├─ playwright.config.ts
 ├─ Templates/quiz-template.spec.ts
 ├─ Predefined/*.spec.ts
-├─ Generated/run-{resultId}.spec.ts     # gitignored
-└─ Artifacts/{resultId}/...             # gitignored
+└─ Generated/run-{resultId}.spec.ts     # gitignored
+
+<host>/wwwroot/Upload/Artifacts/{resultId}/   # screenshots, video.webm, trace.zip — web-served
 ```
 
 **Script root resolution.** The folder is found via `IAppFolders.PlaywrightScriptsFolder`, set from the
 host's **content root** in `QuizSystemWebCoreModule` — so in development it is the project's own
 `App_Data`, not a copy under `bin`, and `node_modules` survives a rebuild. Override with
-`AutomationTesting:ScriptRoot`. Screenshots and video are **not** separate folders: Playwright's
-`--output` directory holds the screenshot, `video.webm` and `trace.zip` for a run together.
+`AutomationTesting:ScriptRoot`.
+
+**Artifacts live under the web root, not the script root.** Playwright's `--output` points at
+`wwwroot/Upload/Artifacts/{resultId}`, which `UseStaticFiles()` already serves and `.gitignore` already
+covers — the same place `GemShopItems` and `Essays` put their uploads. One `--output` directory holds
+the screenshot, `video.webm` and `trace.zip` for a run together. Override with
+`AutomationTesting:ArtifactsRoot` (physical) and `ArtifactsPublicBasePath` (URL prefix).
 
 ## 6. Dynamic Quiz Test — Data Flow
 
@@ -401,10 +407,10 @@ MSBuild enumerates tens of thousands of files on every build.
     unverified.
 - **Assertions are speculative.** `quiz-result-score` and `quiz-result-wrong-count` are assumed; they
   have not been checked against the results page.
-- **Artifacts are listed, not served.** Paths are collected and shown in the console modal, but there is
-  no endpoint streaming the PNG/WebM, so no inline gallery or video replay. Files are on disk under
-  `Artifacts/{resultId}/`.
-- **No retention sweep.** Old `TestingResult` rows, generated specs and artifacts accumulate forever.
+- **Trace files are download-only.** The screenshot renders inline and the video plays in the console
+  modal, but a `trace.zip` still needs `npx playwright show-trace` locally.
+- **No retention sweep.** Old `TestingResult` rows, generated specs and artifacts accumulate forever —
+  now under `wwwroot/Upload/Artifacts`, where videos make it grow faster.
 - **No concurrency cap across runs.** `playwright.config.ts` sets `workers: 1` within a run, but nothing
   limits how many Hangfire runs execute at once.
 - **Retries are not classified.** `RetryCount` is passed to `--retries`, which retries every failure;
@@ -412,6 +418,10 @@ MSBuild enumerates tens of thousands of files on every build.
 - **No quiz-lookup caching** during script generation.
 - **Not implemented:** `UploadPredefinedScript`, `PlaywrightTemplate` CRUD, SignalR, `TestExecutionPage`
   (a modal is used instead), export to PDF/JSON, comparison with previous runs.
+- **Artifacts are public.** Anything under `wwwroot/Upload/Artifacts` is served unauthenticated to
+  anyone who knows the URL, exactly like every other `Upload/` folder. A screenshot of a logged-in test
+  session is therefore world-readable if the path leaks. Serving them through an authorised controller
+  would fix this at the cost of the plain `<img src>`.
 
 ## 12. Deviations From the Original Design
 
@@ -463,7 +473,20 @@ pass is needed. The stored password is `SimpleStringCipher`-encrypted and never 
 `ExecutionConsoleModal`. Driven by the scaffolded page, which drives everything from one page with a
 modal. `ScreenshotGallery` is also blocked on there being no artifact-serving endpoint (§11).
 
-### 12.6 Script root resolves from the content root
+### 12.6 Artifacts moved to wwwroot/Upload
+
+Originally `App_Data/PlaywrightScripts/Screenshots|Videos`. `App_Data` is not web-served, and making it
+so would have exposed the application logs and the test scripts sitting beside it — so artifacts now go
+to `wwwroot/Upload/Artifacts/{resultId}`, which is already served, already gitignored, and already the
+house convention for uploads.
+
+`TestingResult.ArtifactsJson` consequently stores **root-relative URLs** (`/Upload/Artifacts/12/...`)
+rather than file-system paths, matching what `GemShopAppService` stores in `ImagePath`. Each path
+segment is URL-escaped because Playwright names its sub-folder after the test title. The admin panel
+prefixes `abp.appPath` (see `utils/artifactUrl.ts`) so the URL resolves against the API origin and not
+the Vite dev server, then renders images and video inline.
+
+### 12.7 Script root resolves from the content root
 
 Originally `App_Data/PlaywrightScripts` relative to the binary. That puts `node_modules` under `bin`,
 where a clean wipes it. It now comes from `IAppFolders.PlaywrightScriptsFolder`, set from the content
