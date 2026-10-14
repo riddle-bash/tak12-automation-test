@@ -125,7 +125,7 @@ progresses, which is what makes polling show a growing log.
 | ErrorMessage | string(2000) | short reason for a non-`Passed` verdict |
 | ExitCode | int? | |
 | PassedCount / FailedCount | int | parsed from the `line` reporter summary |
-| ArtifactsJson | string | JSON array of **root-relative URLs**, e.g. `/Upload/Artifacts/12/…/video.webm` |
+| ArtifactsJson | string | JSON array of **root-relative URLs**, e.g. `/Upload/AutomationTestPublic/12/…/video.webm`; nulled by `ClearAutomationPublicFolderAsync` |
 | ExecutedByUserId | long? | |
 | HangfireJobId | string(256) | set while queued, so a `Pending` run can be cancelled |
 | CancellationRequested | bool | set by `StopTest`; the job polls it and kills the process |
@@ -196,6 +196,7 @@ Route `/testing/automation`; sidebar entry under **QUẢN TRỊ**, permission `P
 | `FetchTestingResults(FetchTestingResultsInput)` | `FetchTestingResultsOutput` | Paginated runs + whole-set summary |
 | `GetTestingResult(EntityDto<int>)` | `TestingResultDto` | Full detail incl. stdout/stderr/script |
 | `StopTest(EntityDto<int>)` | void | Records the cancel request; kills the process |
+| `ClearAutomationPublicFolderAsync()` | void | Empties the artifacts folder and nulls the stored URLs |
 
 One `ExecuteAutomationTest` replaces the separate `ExecutePredefinedTest` / `ExecuteDynamicQuizTest` —
 the job already branches on `TestType`, so two endpoints bought nothing. `UploadPredefinedScript` is
@@ -267,7 +268,7 @@ CTH.QuizSystem.EntityFrameworkCore/
 ├─ Predefined/*.spec.ts
 └─ Generated/run-{resultId}.spec.ts     # gitignored
 
-<host>/wwwroot/Upload/Artifacts/{resultId}/   # screenshots, video.webm, trace.zip — web-served
+<host>/wwwroot/Upload/AutomationTestPublic/{resultId}/   # screenshots, video.webm, trace.zip
 ```
 
 **Script root resolution.** The folder is found via `IAppFolders.PlaywrightScriptsFolder`, set from the
@@ -275,23 +276,34 @@ host's **content root** in `QuizSystemWebCoreModule` — so in development it is
 `App_Data`, not a copy under `bin`, and `node_modules` survives a rebuild. Override with
 `AutomationTesting:ScriptRoot`.
 
-**Artifacts live under the web root, not the script root.** Playwright's `--output` points at
-`wwwroot/Upload/Artifacts/{resultId}`, which `UseStaticFiles()` already serves and `.gitignore` already
-covers — the same place `GemShopItems` and `Essays` put their uploads. One `--output` directory holds
-the screenshot, `video.webm` and `trace.zip` for a run together. Override with
-`AutomationTesting:ArtifactsRoot` (physical) and `ArtifactsPublicBasePath` (URL prefix).
+**Artifacts live under the web root, not the script root.** Their location is the
+`AutomationTestPublicFolder` **application setting** (`AppSettingNames`/`AppSettingProvider`, default
+`~/Upload/AutomationTestPublic/`) — not appsettings.json — so an admin can move it at runtime. The
+setting is resolved once in `AutomationTestingOptions`:
+
+| Member | Value for the default setting |
+|---|---|
+| `PublicFolderSetting` | `~/Upload/AutomationTestPublic/` (verbatim) |
+| `ArtifactsRoot` | `<webroot>/Upload/AutomationTestPublic` (physical, `--output` target) |
+| `ArtifactsPublicBasePath` | `/Upload/AutomationTestPublic` (stored on the rows) |
+
+Resolving in one place is deliberate: the executor writes to `ArtifactsRoot` and
+`ClearAutomationPublicFolderAsync` deletes from it, so the two can never disagree about which folder
+they mean. `UseStaticFiles()` already serves it and `.gitignore` already covers `wwwroot/Upload`.
 
 ## 6. Dynamic Quiz Test — Data Flow
 
 1. User selects **Quiz-Based Test**, picks one or more quizzes.
 2. Backend loads `Quiz` + `QuizQuestions` → `Question` → `Answers`, filtered to `QuestionStatus.Approved`.
 3. `QuizTestScriptBuilder`:
+   - Resolves the **test account's learning settings** first (see §6.1) — the player does not look the
+     same for every user, so paging and retry have to be known before any step is emitted.
    - Builds navigation + per-question steps (login steps come from the job, not the builder).
    - For each question (respecting `SkipQuestionIds` and `SortOrder`):
      - Resolves the answer per `AnswerStrategy` (correct / seeded-random / explicit mapping).
      - Emits `page.getByTestId('choice-answer-item-{AnswerId}').click()` — all correct options for
        CheckBox, exactly one otherwise.
-     - Emits the next-question step, except on the last question.
+     - Emits the navigation step for the layout in play (next button, or footer question map).
    - Emits submit + confirm-submit steps.
 4. `PlaywrightScriptGeneratorService` loads `quiz-template.spec.ts` and injects the steps and assertions.
 5. `AutomationTestRunJob` writes the spec to `Generated/run-{id}.spec.ts` and `PlaywrightExecutorService`
@@ -300,6 +312,79 @@ the screenshot, `video.webm` and `trace.zip` for a run together. Override with
    it, then shows the verdict, artifacts and the exact script that ran.
 
 The `Random` strategy is seeded off the **test id**, so repeated runs of the same test are comparable.
+
+### 6.1 Adaptive Layout
+
+The quiz player renders differently per quiz **and** per account, so the generator reads both before
+emitting anything. `AutomationTest.TestUserName` is matched against `NormalizedUserName` /
+`NormalizedEmailAddress`; that user's `UserSettings.Settings` blob is parsed into `UserSettingsJson`.
+A missing user, a missing row or unparseable JSON falls back to the app's own defaults (retry allowed,
+paging from the quiz).
+
+**Questions per page** mirrors `QuizPublicAppService.CreateQuizAttempt` exactly:
+
+| condition | questions/page |
+| --- | --- |
+| `QuizType.MockTest` or `IsSpeakingQuiz` | `Quiz.QuestionPerPage` (the account setting is ignored) |
+| `quizPracticeMode = AlwaysSingleQuestion` | 1 |
+| `quizPracticeMode = AlwaysFullQuiz` | 0 |
+| `quizPracticeMode = AlwaysAskMode` | 1 — the spec picks `quiz-mode-option-1` from the dropdown so the run stays deterministic |
+| otherwise | `Quiz.QuestionPerPage` |
+
+**Navigation** follows from that. `ExerciseByQuiz.getPagingMode()` returns `'all'` for anything other
+than *exactly one* question per page, and `'all'` sets `noCheckAnswer`, which is what hides the
+per-question next button. So:
+
+- `QuizType.MockTest`, or questions/page **≠ 1** (0, 2, 5, …) → **no per-question next button**. The
+  script walks the footer question map (`quiz-footer-nav-item-{questionId}`) and submits with
+  `quiz-header-submit-btn`. Because the map only renders a sliding window of chips (5–20,
+  viewport-dependent — `getItemsPerPage`), the emitted `gotoQuestion` helper steps the window with
+  `quiz-footer-next-page-btn` until the target chip is visible.
+- Exactly 1 per page → `next-question-btn-{questionId}` between questions and
+  `submit-quiz-btn-{lastAnswerableQuestionId}` at the end.
+
+**Description questions** (`QuestionType.Description`) carry no answer:
+
+- under footer navigation they are skipped entirely — `QuizFooterNavItem` renders `null` for them, so no
+  chip exists to click;
+- when `DisplayAllChildren` is `true` they open a *gathered block* (below) and are skipped;
+- otherwise one next-button click steps past them.
+
+A trailing Description also means the submit button is keyed by the last **answerable** question, not
+simply the last row.
+
+**`DisplayAllChildren` blocks.** At 1 question per page, a top-level Description with
+`DisplayAllChildren` puts itself and every child (`Question.ParentQuestionId = {descriptionId}`) on one
+page — `getPagingMode()` calls this `'gathered'`. Nothing in the block has a next button of its own:
+`NextQuestionButtonContainer` only renders one when `pagingMode !== 'gathered'`, and the children are
+checked as each option is clicked. Instead a floating banner appears once every question in the block is
+answered (`SubmitInfoBanner`, `displayed={pagingMode === 'gathered' && isAllAnswersValid}`) and carries
+the step forward:
+
+- mid-quiz → `submit-info-banner-next-btn` (emitted through the `advanceFromBanner` helper after the
+  block's last question);
+- on the last page → `submit-info-banner-submit-btn`, which replaces `submit-quiz-btn-{questionId}` when
+  the quiz ends inside a block.
+
+Standalone questions in the same quiz keep their normal next button: `QuestionViewWrapper` hands a
+childless question `pagingMode='default'`, and the banner stays hidden because the page has no children.
+
+**Retry.** `retryMode = AllowRetry` (`0` — see the note in §12.9) means a wrong answer re-opens the
+question instead of advancing. The generator then emits, after the next-button click:
+
+```typescript
+if (await offersRetry(1195304)) {
+  await page.getByTestId('choice-answer-item-2313972').click();  // a correct option not picked first
+  await page.getByTestId('next-question-btn-1195304').click();
+}
+```
+
+`offersRetry` waits up to 1.5 s for `can-retry-info-viewer-{questionId}`. Retry is emitted only where a
+per-question check actually happens — never under footer navigation (nothing is checked until submit,
+and the server forces `disableRetry` for mock tests), never on the last question (it goes straight to
+submit), and never for `CheckBox` (its options toggle, so "pick another" is not one click). Inside a
+gathered block the check happens on click, so the branch is emitted *before* the block's banner step and
+needs no confirming click of its own.
 
 ## 7. Playwright Skeleton Template
 
@@ -360,15 +445,24 @@ rejects the request up front with a clear message and the modal disables the tog
 
 ## 10. Environment & Configuration
 
+Settings are split by what they describe. Anything tied to the **box the runner lives on** is
+appsettings; anything describing **what is being tested** is an ABP application setting, so it can be
+changed at runtime from the Settings UI.
+
 ```json
 "AutomationTesting": {
   "ScriptRoot": "",                 // blank = <content root>/App_Data/PlaywrightScripts
-  "BaseUrl": "http://localhost:3000",
   "NodeExecutable": "npx",
   "DefaultTimeoutSeconds": 300,
-  "AllowHeadedRuns": false
+  "AllowHeadedRuns": false,
+  "MaxParallelRuns": 1              // runs above this stay Pending; see §11
 }
 ```
+
+| application setting | used for |
+| --- | --- |
+| `EK12Protocol` + `EK12HostingDomain` | `DefaultBaseUrl` — the site the specs navigate against when a test sets no Base URL of its own |
+| `AutomationTestPublicFolder` | where artifacts are written, served from and cleared (§5) |
 
 **Node resolution.** `npx` is `npx.cmd` under the official Node MSI but `npx.exe` under Volta and nvm,
 so the executor searches `PATH` for `.exe`/`.cmd`/`.bat` and uses the full resolved path rather than
@@ -395,7 +489,10 @@ MSBuild enumerates tens of thousands of files on every build.
 - **Quiz-generated selectors are only partly verified.** The confirmed-correct ones (from a real
   recording against the app) are `quiz-attempt-btn-{quizId}`, `choice-answer-item-{answerId}`,
   `next-question-btn-{questionId}`, `submit-quiz-btn-{lastQuestionId}`, `submit-confirm-submit-btn`.
-  Two things the generator emits are **not** confirmed:
+  The adaptive-layout selectors of §6.1 — `quiz-attempt-btn-dropdown-{quizId}`, `quiz-mode-option-1`,
+  `quiz-footer-nav-item-{questionId}`, `quiz-footer-next-page-btn`, `quiz-header-submit-btn`,
+  `can-retry-info-viewer-{questionId}` — were read out of the components but have **not** been confirmed
+  by a recorded run. Two more things the generator emits are **not** confirmed:
   - **Login steps.** The generator emits `login-username-input` / `login-password-input` /
     `login-submit-btn`. The real app instead exposes `login-form-login-link` on the home page and then
     role-based fields (`getByRole('textbox', { name: 'Username or email' })`, `… 'Password'`,
@@ -409,16 +506,22 @@ MSBuild enumerates tens of thousands of files on every build.
   have not been checked against the results page.
 - **Trace files are download-only.** The screenshot renders inline and the video plays in the console
   modal, but a `trace.zip` still needs `npx playwright show-trace` locally.
-- **No retention sweep.** Old `TestingResult` rows, generated specs and artifacts accumulate forever —
-  now under `wwwroot/Upload/Artifacts`, where videos make it grow faster.
-- **No concurrency cap across runs.** `playwright.config.ts` sets `workers: 1` within a run, but nothing
-  limits how many Hangfire runs execute at once.
+- **No automatic retention sweep.** Old `TestingResult` rows and generated specs accumulate forever.
+  Artifacts can at least be reclaimed on demand via `ClearAutomationPublicFolderAsync` (permission
+  `Pages.AutomationTesting.Delete`), which is all-or-nothing — there is no "older than N days" option,
+  and no scheduled job calling it.
+- **The parallel cap is advisory, not a lock.** `AutomationTesting:MaxParallelRuns` (default 1) gates
+  `AutomationTestRunJob` before it flips a row to `Running`; over-cap runs stay `Pending` and requeue
+  themselves every 15 s. Two jobs that check the count at the same instant can both pass, so the cap can
+  be exceeded by the number of simultaneous starts. It stops a bulk execute from launching a dozen
+  browsers; it is not a semaphore. A `Running` row older than `max(DefaultTimeoutSeconds * 2, 1800s)` is
+  ignored by the count so a job that died without writing a verdict cannot stall the queue forever.
 - **Retries are not classified.** `RetryCount` is passed to `--retries`, which retries every failure;
   the design's "only auto-retry on transient/timeout errors" is not implemented.
 - **No quiz-lookup caching** during script generation.
 - **Not implemented:** `UploadPredefinedScript`, `PlaywrightTemplate` CRUD, SignalR, `TestExecutionPage`
   (a modal is used instead), export to PDF/JSON, comparison with previous runs.
-- **Artifacts are public.** Anything under `wwwroot/Upload/Artifacts` is served unauthenticated to
+- **Artifacts are public.** Anything under the configured public folder is served unauthenticated to
   anyone who knows the URL, exactly like every other `Upload/` folder. A screenshot of a logged-in test
   session is therefore world-readable if the path leaks. Serving them through an authorised controller
   would fix this at the cost of the plain `<img src>`.
@@ -486,9 +589,42 @@ segment is URL-escaped because Playwright names its sub-folder after the test ti
 prefixes `abp.appPath` (see `utils/artifactUrl.ts`) so the URL resolves against the API origin and not
 the Vite dev server, then renders images and video inline.
 
-### 12.7 Script root resolves from the content root
+### 12.7 The artifacts folder is an application setting, not appsettings.json
+
+First implemented as `AutomationTesting:ArtifactsRoot` / `ArtifactsPublicBasePath` in appsettings.
+Replaced by the `AutomationTestPublicFolder` **ABP setting** so it is editable at runtime like
+`ProfilePicturesFolder` and the other `~/Upload/...` folder settings, and so one property feeds both
+the executor and the clear operation. The appsettings keys were removed rather than left as a second,
+silently-ignored source of truth.
+
+### 12.8 Script root resolves from the content root
 
 Originally `App_Data/PlaywrightScripts` relative to the binary. That puts `node_modules` under `bin`,
 where a clean wipes it. It now comes from `IAppFolders.PlaywrightScriptsFolder`, set from the content
 root alongside the existing `WebLogsFolder`, so dev uses the project folder and publish uses the publish
 folder. Both `Web.Mvc` and `Web.Host` carry a workspace.
+
+### 12.9 The target site comes from the EK12 settings, not appsettings
+
+`DefaultBaseUrl` was `AutomationTesting:BaseUrl` in appsettings (`https://tak12.com` in Web.Mvc). It now
+reads `EK12Protocol` + `EK12HostingDomain` through `ISettingManager`, the same pair
+`EditionAppService`, `TeacherReportAppService` and the admin panel's `getEk12BaseUrl()` already use.
+Two reasons: the learner-facing host was configured in two unrelated places that could disagree, and
+moving the suite between environments was a redeploy instead of a settings change. The appsettings key
+was deleted rather than left as a silently-ignored second source of truth — the same call as §12.7.
+
+A domain containing `://` is returned verbatim, since an admin pasting a full URL into the domain box is
+more likely than wanting `https://https://…`.
+
+### 12.10 `RetryMode` values were inverted, and `UserSettingsJson` did not compile
+
+`CTH.QuizSystem.Core/Quizzes/UserSettingsJson.cs` declared `RetryMode { DisallowRetry = 0, AllowRetry = 1 }`.
+The data says the opposite: `UserSettingsRepository.IsRetryDisabledAsync` returns `retryMode == 1`, and
+the "AllowRetry" switch in `UserSettingsViewer.jsx` is `checked={pendingSettings.retryMode !== 1}`. Taken
+literally, the generator would have emitted retry handling for exactly the accounts that have retry
+turned **off**. The enum now reads `AllowRetry = 0, DisallowRetry = 1`, which also makes `default(RetryMode)`
+— used when an account has no settings row — mean "retry allowed", matching the repository's `return false`.
+
+Both enums in that file were also implicitly `internal` while the properties exposing them were `public`,
+so the Core project failed to build with two `CS0053`s. They are now `public`. `UserSettingsJson` had no
+callers before this change, which is why the break had gone unnoticed.
